@@ -1,6 +1,6 @@
 from cereal import car
 from opendbc.can.packer import CANPacker
-from openpilot.common.numpy_fast import clip
+from openpilot.common.numpy_fast import clip,interp
 from openpilot.common.conversions import Conversions as CV
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.car import apply_driver_steer_torque_limits
@@ -27,6 +27,8 @@ class CarController(CarControllerBase):
     self.eps_timer_soft_disable_alert = False
     self.hca_frame_timer_running = 0
     self.hca_frame_same_torque = 0
+    self.last_standstill = False
+    self.standstill_req = False
 
     # dp
     self.dp_vag_sng = Params().get("dp_vag_sng")
@@ -87,9 +89,59 @@ class CarController(CarControllerBase):
       accel = clip(actuators.accel, self.CCP.ACCEL_MIN, self.CCP.ACCEL_MAX) if CC.longActive else 0
       stopping = actuators.longControlState == LongCtrlState.stopping
       starting = actuators.longControlState == LongCtrlState.pid and (CS.esp_hold_confirmation or CS.out.vEgo < self.CP.vEgoStopping)
+
+      if CS.out.standstill and not self.last_standstill and self.CP.enableGasInterceptor:
+              self.standstill_req = True
+      self.last_standstill = CS.out.standstill
+
+      if self.CP.enableGasInterceptor and CS.out.vEgo < self.CP.vEgoStopping:
+        accel = clip(self.CP.stopAccel, self.CCP.ACCEL_MIN, self.CCP.ACCEL_MAX) if CC.longActive and (starting or CS.out.standstill) else accel
+        stopping = True if CC.longActive and (starting or CS.out.standstill) else stopping
+
       can_sends.extend(self.CCS.create_acc_accel_control(self.packer_pt, CANBUS.pt, CS.acc_type, CC.longActive, accel,
                                                          acc_control, stopping, starting, CS.esp_hold_confirmation))
+      if self.CP.enableGasInterceptor:
+        self.gas = 0.0
+        if CC.longActive and actuators.accel >0 and CS.out.vEgo <4:
+          #speed = CS.out.vEgo
+          #cd = 0.31
+          #frontalArea = 2.3
+          #drag = 0.5 * cd * frontalArea * (speed ** 2)
 
+          #mass = 1772
+          #g = 9.81
+          #rollingFrictionCoefficient = 0.02
+          #friction = mass * g * rollingFrictionCoefficient
+
+          #desiredAcceleration = actuators.accel
+          #acceleration = mass * desiredAcceleration
+
+          #driveTrainLosses = 0  # 600 for the engine, 200 for trans, low speed estimate
+          #powerNeeded = (drag + friction + acceleration) * speed + driveTrainLosses
+          #POWER_LOOKUP_BP = [0, 25000 * 1.6 / 2.6,
+          #                     75000]  # 160NM@1500rpm=25kW but with boost, no boost means *1.6/2.6
+          #PEDAL_LOOKUP_BP = [227, 1772 * 0.4,
+          #                    1772 * 100 / 140]  # Not max gas, max gas gives 140hp, we want at most 100 hp, also 40% throttle might prevent an upshift
+
+          #GAS_MULTIPLIER_BP = [0, 0.1, 0.2, 0.4, 8.3]
+          #GAS_MULTIPLIER_V = [1.15, 1.15, 1.2, 1.25, 1.]
+
+          #powerNeeded_mult = interp(CS.out.vEgo, [20 / 3.6, 40 / 3.6], [2, 1])
+          #powerNeeded = int(round(powerNeeded * powerNeeded_mult))
+          #apply_gas = int(round(interp(powerNeeded, POWER_LOOKUP_BP, PEDAL_LOOKUP_BP)))
+          #apply_gas = int(round(apply_gas * int(round(interp(speed, GAS_MULTIPLIER_BP, GAS_MULTIPLIER_V)))))
+          #wind_brake = interp(CS.out.vEgo, [0.0, 2.3, 35.0], [0.001, 0.002, 0.15])
+          #gas_mult = interp(CS.out.vEgo, [0., 10.], [0.4, 1.0])
+          PEDAL_SCALE = interp(CS.out.vEgo, [0.0, 3, 5], [0.9, 0.5, 0.0])
+          # offset for creep and windbrake
+          pedal_offset = interp(CS.out.vEgo, [0.0, 2.3, 5], [-.2, 0.0, 0.2])
+          pedal_command = 430 +PEDAL_SCALE * (actuators.accel + pedal_offset)*(1600-430)
+          interceptor_gas_cmd = clip(pedal_command, 420, 1300)
+          self.gas = interceptor_gas_cmd
+          #self.gas = apply_gas if apply_gas < 1200  else 1200
+        else:
+          self.gas = 0.0
+        can_sends.append(self.CCS.create_pedal_control(self.packer_pt,  CANBUS.pt, self.gas, self.frame // 2))
     # **** HUD Controls ***************************************************** #
 
     if self.frame % self.CCP.LDW_STEP == 0:

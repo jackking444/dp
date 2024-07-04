@@ -11,7 +11,8 @@ if [ -z "$AGNOS_VERSION" ]; then
 fi
 
 export STAGING_ROOT="/data/safe_staging"
-
+export SKIP_FW_QUERY=1
+export FINGERPRINT="VOLKSWAGEN_SHARAN_MK2"
 ### dp_stock_begin ###
 if [ -f /data/media/0/dp_nav_mapbox_token ]; then
   token=$(cat /data/media/0/dp_nav_mapbox_token)
